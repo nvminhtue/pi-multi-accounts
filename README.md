@@ -34,12 +34,13 @@ Then run `/reload` (or restart Pi).
 | `/account <name/id>`          | Use an exact saved Claude name or registered Codex provider ID |
 | `/account save <name>`        | Save the current built-in Anthropic `/login` under `<name>` |
 | `/account list`               | List Claude accounts (● active, ○ inactive) and Codex providers (login state) |
+| `/account usage`              | Show subscription usage (5h / weekly limits, reset times) of every logged-in account |
 | `/account remove <name>`      | Forget a saved Claude account (`auth.json` is not changed) |
 | `/account help`               | Show command help                                   |
 
 Use `/account login` instead of Pi's built-in `/login` for this extension's accounts. It explains every step in the session, saves the Claude login under a name, and registers new Codex homes without `/reload`. The built-in `/login` still works; adopt its Claude login with `/account save <name>`.
 
-Save and remove work on **Claude accounts only**. Their arguments are literal Claude names, not provider qualifiers. `login` is a reserved name: a Claude account saved as `login` by an older version stays reachable with `/account use login` or `/account claude:login`.
+Save and remove work on **Claude accounts only**. Their arguments are literal Claude names, not provider qualifiers. `login` and `usage` are reserved names: a Claude account saved under one of them by an older version stays reachable with `/account use <name>` or `/account claude:<name>`.
 
 Claude selection changes shared credentials. It does not change the session model. Codex selection changes only this session's model. It does not change Claude credentials or the default model for new sessions.
 
@@ -73,6 +74,30 @@ The provider has the same models as the built-in `openai-codex`. The command rep
 
 The Codex auth file stays the source of truth: on refresh the extension first adopts newer tokens found in the file (e.g. refreshed by the Codex CLI); otherwise it refreshes with the file's refresh token and writes the rotated tokens back. `~/.codex-*` folders are discovered at load time; later ones are added by `/account login codex <name>` or `/reload`.
 
+## Usage limits
+
+`/account usage` checks the subscription quota of every logged-in account at once:
+
+```text
+Claude accounts:
+[Claude] ● personal <me@example.com>
+    5h  ██░░░░░░░░  20%  resets in 4h 49m
+    7d  █░░░░░░░░░  10%  resets in 6d 16h
+[Claude] ○ work <me@work.example>
+    5h  ████░░░░░░  40%  resets in 29m
+    7d  ░░░░░░░░░░   1%  resets in 6d 22h
+
+Codex providers:
+[Codex] ● openai-codex-team (plus)
+    5h  █░░░░░░░░░   7%  resets in 3h 2m
+    7d  ███░░░░░░░  31%  resets in 5d 1h
+```
+
+- Claude: every saved account plus an unsaved login in `auth.json`. Model-scoped weekly caps and enabled extra usage are listed when Anthropic reports them.
+- Codex: the built-in `openai-codex` login and every logged-in `openai-codex-<name>` provider, with the plan type.
+- Active logins get their token from Pi, which refreshes it under its own lock. An expired token of an inactive Claude account is refreshed by the extension and the rotated token is saved in `claude-accounts.json` at once.
+- An account that fails (expired login, HTTP 401/429) shows its error inline; the others are still listed.
+
 ## How it works (Claude)
 
 - Pi keeps a single `anthropic` entry in `~/.pi/agent/auth.json`. Switching replaces that entry and leaves other providers untouched.
@@ -85,8 +110,9 @@ The Codex auth file stays the source of truth: on refresh the extension first ad
 
 - `auth.json` is shared: a Claude switch affects **every running Pi session**. A Codex switch changes only the current session model.
 - It relies on Pi internals (the `auth.json` format and its lock directory). Tested with Pi 0.99.2.
-- The Anthropic profile endpoint is unofficial and may change.
-- The OpenAI token endpoint and client id used for Codex refresh are unofficial and may change.
+- The Anthropic profile and usage endpoints (`/api/oauth/profile`, `/api/oauth/usage`) are unofficial and may change.
+- The OpenAI token endpoint, client id and usage endpoint (`chatgpt.com/backend-api/wham/usage`) used for Codex are unofficial and may change.
+- The Claude usage endpoint is rate limited; running `/account usage` in quick succession can return HTTP 429 for a few minutes.
 - The Codex CLI and Pi share each Codex refresh token (single use); if both refresh at once, one of them may need `codex login` and `/login` again.
 - `claude-accounts.json` contains refresh tokens. Keep it private and never commit it.
 
@@ -104,8 +130,10 @@ src/index.ts                  entry point: shares one registered Codex-home snap
 src/accounts.ts               /account command, typed entries, exact resolution and completions
 src/claude.ts                 Claude credentials, status, validation and lifecycle sync
 src/codex.ts                  Codex parallel providers and session-model selection
+src/usage.ts                  Claude/Codex usage endpoints, parsing and formatting for /account usage
 test/account.test.mjs         node:test suite for /account (temp PI_CODING_AGENT_DIR and HOME, no network)
 test/codex.test.mjs           node:test suite for the Codex providers (stubbed fetch, no network)
+test/usage.test.mjs           node:test suite for usage parsing and formatting
 ```
 
 ## License

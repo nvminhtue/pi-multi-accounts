@@ -24,7 +24,8 @@ import { existsSync, readdirSync, readFileSync, renameSync, writeFileSync } from
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { mutateAuth, readAuth } from "./claude.ts";
-import type { CodexEntry } from "./accounts.ts";
+import type { CodexEntry, CodexUsage } from "./accounts.ts";
+import { fetchCodexUsage, settle } from "./usage.ts";
 
 const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const TOKEN_URL = "https://auth.openai.com/oauth/token";
@@ -32,6 +33,7 @@ const BASE_URL = "https://chatgpt.com/backend-api";
 const JWT_AUTH_CLAIM = "https://api.openai.com/auth";
 const EXPIRY_SKEW_MS = 5 * 60_000;
 const HOME_DIR_PATTERN = /^\.codex-([a-z0-9][a-z0-9_-]*)$/i;
+const BUILTIN_PROVIDER = "openai-codex";
 
 interface CodexAuthFile {
 	auth_mode?: string;
@@ -315,5 +317,26 @@ export function createCodexProvider(pi: ExtensionAPI, homes: readonly CodexHome[
 		if (await ctx.ui.confirm("Use it now?", `Switch this session to ${id}?`)) await useAccount(id, ctx);
 	}
 
-	return { getIds, getEntries, useAccount, login };
+	/** Usage of the built-in openai-codex login and every logged-in Codex home. Pi refreshes expiring tokens. */
+	async function getUsage(ctx: ExtensionContext): Promise<CodexUsage[]> {
+		const auth = readAuth();
+		const isLoggedIn = (id: string) => (auth[id] as { type?: unknown } | undefined)?.type === "oauth";
+		const ids = [BUILTIN_PROVIDER, ...getIds()].filter(isLoggedIn);
+		return Promise.all(
+			ids.map(async (id) => ({
+				id,
+				isActive: ctx.model?.provider === id,
+				usage: await settle(async () => {
+					const access = (await ctx.modelRegistry.getProviderAuth(id))?.auth.apiKey;
+					if (!access) {
+						const relogin = id === BUILTIN_PROVIDER ? "/login" : `/account login codex ${id.slice(BUILTIN_PROVIDER.length + 1)}`;
+						throw new Error(`no usable login; run ${relogin}`);
+					}
+					return fetchCodexUsage(access);
+				}),
+			})),
+		);
+	}
+
+	return { getIds, getEntries, getUsage, useAccount, login };
 }

@@ -845,3 +845,91 @@ test("login without a provider asks for the account type and Codex home", async 
 	assert.equal(readJson(AUTH)["openai-codex-team"].refresh, "codex-refresh");
 	assert.equal(setModelCalls.length, 0);
 });
+
+/** Stubs the Anthropic refresh, Pi's token lookup and both usage endpoints for one `/account usage` run. */
+async function runUsage({ onRefresh = () => {} } = {}) {
+	const refreshed = [];
+	const requests = [];
+	const codexAccess = jwt({ exp: 4_000_000_000, "https://api.openai.com/auth": { chatgpt_account_id: "acct-team" } });
+	const auth = readJson(AUTH);
+	auth["openai-codex-team"] = { type: "oauth", access: codexAccess, refresh: "codex-refresh", expires: 4_000_000_000_000 };
+	writeFileSync(AUTH, JSON.stringify(auth));
+	const { getProvider } = ctx.modelRegistry;
+	ctx.modelRegistry.getProvider = () => ({
+		auth: {
+			oauth: {
+				refresh: async (credential) => {
+					refreshed.push(credential.refresh);
+					onRefresh();
+					return { type: "oauth", refresh: "refresh-personal-2", access: "access-personal-2", expires: Date.now() + 3_600_000 };
+				},
+			},
+		},
+	});
+	ctx.modelRegistry.getProviderAuth = async (id) => ({ auth: { apiKey: id === "anthropic" ? "access-work" : codexAccess } });
+	const blockedFetch = globalThis.fetch;
+	const resetsAt = new Date(Date.now() + 2 * 3_600_000 + 30 * 60_000).toISOString();
+	globalThis.fetch = async (url, init) => {
+		const token = init.headers.Authorization;
+		requests.push(`${url} ${token} ${init.headers["ChatGPT-Account-Id"] ?? ""}`.trim());
+		if (url.endsWith("/wham/usage")) {
+			return Response.json({
+				plan_type: "plus",
+				rate_limit: { limit_reached: false, primary_window: { used_percent: 7, limit_window_seconds: 18_000, reset_after_seconds: 630 } },
+			});
+		}
+		if (token === "Bearer access-work") return Response.json({ five_hour: { utilization: 25, resets_at: resetsAt }, seven_day: null });
+		if (token === "Bearer access-personal-2") return Response.json({ limits: [{ kind: "weekly_all", percent: 60, resets_at: resetsAt }] });
+		return new Response("", { status: 401 });
+	};
+	try {
+		await account("usage");
+	} finally {
+		globalThis.fetch = blockedFetch;
+		ctx.modelRegistry.getProvider = getProvider;
+		delete ctx.modelRegistry.getProviderAuth;
+	}
+	return { refreshed, requests };
+}
+
+test("usage refreshes an expired inactive Claude slot, keeps the rotated token and reports every login", async () => {
+	resetFixture();
+	const store = readJson(STORE);
+	store.accounts.personal.cred.expires = Date.now() - 1;
+	writeFileSync(STORE, JSON.stringify(store));
+	const { refreshed, requests } = await runUsage();
+	assert.deepEqual(refreshed, ["refresh-personal"]);
+	assert.equal(readJson(STORE).accounts.personal.cred.refresh, "refresh-personal-2");
+	assert.equal(readJson(STORE).accounts.work.cred.refresh, "refresh-work");
+	assert.equal(readJson(AUTH).anthropic.refresh, "refresh-work");
+	assert.ok(requests.includes("https://api.anthropic.com/api/oauth/usage Bearer access-personal-2"));
+	assert.ok(requests.some((r) => r.startsWith("https://chatgpt.com/backend-api/wham/usage Bearer e30.") && r.endsWith(" acct-team")));
+	const report = lastNotice().message;
+	assert.match(report, /\[Claude\] ● work <work@example.com>\n {4}5h .* 25% {2}resets in 2h 29m/);
+	assert.match(report, /\[Claude\] ○ personal\n {4}7d .* 60%/);
+	assert.match(report, /\[Codex\] ○ openai-codex-team \(plus\)\n {4}5h .* {2}7% {2}resets in 10m/);
+	assert.doesNotMatch(report, /openai-codex(?!-)/, "the built-in provider is not logged in");
+});
+
+test("usage moves a refreshed token into auth.json when that account became active meanwhile", async () => {
+	resetFixture();
+	const store = readJson(STORE);
+	store.accounts.personal.cred.expires = Date.now() - 1;
+	writeFileSync(STORE, JSON.stringify(store));
+	// Another session switches to "personal" while its old refresh token is being exchanged.
+	await runUsage({ onRefresh: () => writeAuth(store.accounts.personal.cred) });
+	assert.equal(readJson(AUTH).anthropic.refresh, "refresh-personal-2");
+	assert.equal(readJson(AUTH).openai.key, "openai-key");
+	assert.equal(readJson(STORE).accounts.personal.cred.refresh, "refresh-personal-2");
+});
+
+test("usage reports a failed account inline without hiding the others", async () => {
+	resetFixture();
+	const store = readJson(STORE);
+	store.accounts.personal.cred.access = "access-revoked";
+	writeFileSync(STORE, JSON.stringify(store));
+	await runUsage();
+	assert.equal(lastNotice().level, "info");
+	assert.match(lastNotice().message, /\[Claude\] ○ personal\n {4}error: usage request failed: HTTP 401/);
+	assert.match(lastNotice().message, /\[Claude\] ● work/);
+});

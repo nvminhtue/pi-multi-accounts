@@ -2,6 +2,8 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { ClaudeProvider, SUBCOMMANDS } from "./claude.ts";
 import { createCodexProvider } from "./codex.ts";
 import type { CodexHome } from "./codex.ts";
+import { formatUsage } from "./usage.ts";
+import type { UsageResult } from "./usage.ts";
 
 export interface ClaudeEntry {
 	provider: "claude";
@@ -23,6 +25,17 @@ export interface CodexEntry {
 export interface ClaudeStatus {
 	entries: ClaudeEntry[];
 	unsavedLogin?: { email?: string };
+}
+
+export interface ClaudeUsage {
+	entries: { entry: ClaudeEntry; usage: UsageResult }[];
+	unsavedLogin?: { email?: string; usage: UsageResult };
+}
+
+export interface CodexUsage {
+	id: string;
+	isActive: boolean;
+	usage: UsageResult;
 }
 
 type AccountEntry = ClaudeEntry | CodexEntry;
@@ -57,6 +70,26 @@ function formatList(claude: ClaudeStatus, codex: CodexEntry[]): string {
 		lines.push(`  ${marker} ${entry.name}  ${entry.id}  ${entry.authPath}  ${state}`);
 	}
 	if (!codex.length) lines.push("No registered Codex homes. Run /account login codex <name> to add one.");
+	return lines.join("\n");
+}
+
+function formatUsageReport(claude: ClaudeUsage, codex: CodexUsage[]): string {
+	const now = Date.now();
+	const lines = ["Claude accounts:"];
+	for (const { entry, usage } of claude.entries) {
+		lines.push(`[Claude] ${entry.isActive ? "●" : "○"} ${formatClaudeName(entry)}`, ...formatUsage(usage, now));
+	}
+	if (claude.unsavedLogin) {
+		const email = claude.unsavedLogin.email ? ` (${claude.unsavedLogin.email})` : "";
+		lines.push(`[Claude] ● unsaved login${email}`, ...formatUsage(claude.unsavedLogin.usage, now));
+	}
+	if (!claude.entries.length && !claude.unsavedLogin) lines.push("No Claude logins. Run /account login claude <name>.");
+	lines.push("", "Codex providers:");
+	for (const { id, isActive, usage } of codex) {
+		const plan = usage.ok && usage.report.plan ? ` (${usage.report.plan})` : "";
+		lines.push(`[Codex] ${isActive ? "●" : "○"} ${id}${plan}`, ...formatUsage(usage, now));
+	}
+	if (!codex.length) lines.push("No logged-in Codex providers. Run /account login codex <name>.");
 	return lines.join("\n");
 }
 
@@ -97,6 +130,12 @@ export function registerAccounts(pi: ExtensionAPI, homes: readonly CodexHome[]):
 	async function cmdList(ctx: ExtensionContext): Promise<void> {
 		const claude = await ClaudeProvider.getStatus(ctx);
 		ctx.ui.notify(formatList(claude, codex.getEntries(ctx)), "info");
+	}
+
+	async function cmdUsage(ctx: ExtensionContext): Promise<void> {
+		ctx.ui.notify("Checking usage of every logged-in account…", "info");
+		const [claude, codexUsage] = await Promise.all([ClaudeProvider.getUsage(ctx), codex.getUsage(ctx)]);
+		ctx.ui.notify(formatUsageReport(claude, codexUsage), "info");
 	}
 
 	async function useEntry(entry: AccountEntry, ctx: ExtensionContext): Promise<void> {
@@ -166,6 +205,7 @@ export function registerAccounts(pi: ExtensionAPI, homes: readonly CodexHome[]):
 			case "switch": return cmdUse(arg, ctx);
 			case "list":
 			case "ls": return cmdList(ctx);
+			case "usage": return cmdUsage(ctx);
 			case "help": return ctx.ui.notify(HELP, "info");
 			default: return cmdUse(args.trim(), ctx);
 		}
@@ -195,6 +235,7 @@ const HELP = [
 	"/account save|add <name> save the current built-in /login as a Claude account (literal Claude name)",
 	"/account remove|rm <name> forget saved Claude login (literal Claude name)",
 	"/account list|ls         list accounts, login states and auth paths",
+	"/account usage           show subscription usage (5h/weekly limits) of every logged-in account",
 	"Another account of the same service? Open the login URL in a private window, or the browser reuses the signed-in account.",
 	"Claude changes shared credentials, not the session model. Save and remove are Claude-only.",
 	"Codex changes only this session's model, not Claude credentials or the default model.",
