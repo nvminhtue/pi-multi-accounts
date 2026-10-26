@@ -54,6 +54,10 @@ let notices = [];
 let statuses = [];
 let selectImpl = async () => undefined;
 let confirmImpl = async () => true;
+let inputImpl = async () => undefined;
+// Stands in for Pi's built-in Anthropic OAuth flow (`provider.auth.oauth.login`).
+let anthropicLogin = async () => { throw new Error("no Anthropic login expected"); };
+let refreshCalls = [];
 const ctx = {
 	hasUI: true,
 	model: { provider: "anthropic", id: "shared", name: "Shared" },
@@ -61,12 +65,15 @@ const ctx = {
 		find: (provider, id) => models.find((model) => model.provider === provider && model.id === id),
 		getAll: () => models,
 		hasConfiguredAuth: () => true,
+		getProvider: (id) => (id === "anthropic" ? { auth: { oauth: { login: (interaction) => anthropicLogin(interaction) } } } : undefined),
+		refresh: async (options) => { refreshCalls.push(options); return { aborted: false, errors: new Map() }; },
 	},
 	ui: {
 		notify: (message, level) => notices.push({ message, level }),
 		setStatus: (key, text) => statuses.push({ key, text }),
 		confirm: (title, message) => confirmImpl(title, message),
-		select: (title, options) => selectImpl(title, options),
+		select: (title, options, opts) => selectImpl(title, options, opts),
+		input: (title, placeholder, opts) => inputImpl(title, placeholder, opts),
 	},
 };
 
@@ -77,6 +84,9 @@ const resetUi = () => {
 	statuses = [];
 	selectImpl = async () => undefined;
 	confirmImpl = async () => true;
+	inputImpl = async () => undefined;
+	anthropicLogin = async () => { throw new Error("no Anthropic login expected"); };
+	refreshCalls = [];
 };
 
 before(async () => {
@@ -199,7 +209,7 @@ test("list shows Codex providers: not logged in, then logged in", async () => {
 	const before = lastNotice().message;
 	assert.match(before, /^Claude accounts \(credentials shared across Pi sessions\):/);
 	assert.match(before, /Codex providers \(model selection for this session only\):/);
-	assert.match(before, /openai-codex-team .*auth\.json {2}not logged in \(\/login → "OpenAI Codex \(team\)"\)/);
+	assert.match(before, /openai-codex-team .*auth\.json {2}not logged in \(\/account login codex team\)/);
 
 	resetUi();
 	const auth = readJson(AUTH);
@@ -287,7 +297,7 @@ test("non-UI empty input lists complete status without a dialog", async () => {
 	selectImpl = () => { throw new Error("no dialog expected"); };
 	await account("");
 	assert.match(lastNotice().message, /work@example.com/);
-	assert.match(lastNotice().message, /not logged in.*\/login/);
+	assert.match(lastNotice().message, /not logged in \(\/account login codex team\)/);
 });
 
 test("aliases preserve save, list, switch and remove operations without capability warnings", async () => {
@@ -480,7 +490,7 @@ for (const hasSameId of [true, false]) {
 		selectImpl = () => { throw new Error("auth check must precede dialog"); };
 		await account("openai-codex-team");
 		assert.equal(lastNotice().level, "error");
-		assert.match(lastNotice().message, /\/login → "OpenAI Codex \(team\)"/);
+		assert.match(lastNotice().message, /\/account login codex team/);
 		assert.equal(setModelCalls.length, 0);
 		assert.equal(ctx.model.provider, "anthropic");
 	});
@@ -517,7 +527,7 @@ for (const result of ["false", "throw"]) {
 		await account("openai-codex-team");
 		assert.equal(notices.length, 1);
 		assert.equal(lastNotice().level, "error");
-		assert.match(lastNotice().message, result === "false" ? /\/login/ : /account: model change failed/);
+		assert.match(lastNotice().message, result === "false" ? /\/account login codex team/ : /account: model change failed/);
 		assert.equal(setModelCalls.length, 1);
 		assert.equal(ctx.model, originalModel);
 		assert.deepEqual(snapshotCredentials(), before);
@@ -566,7 +576,7 @@ test("empty Claude status keeps login and save guidance", async () => {
 	writeFileSync(STORE, JSON.stringify({ accounts: {} }));
 	writeAuth(undefined);
 	await account("list");
-	assert.match(lastNotice().message, /No saved accounts\. Run \/login, then \/account save <name>/);
+	assert.match(lastNotice().message, /No saved accounts\. Run \/account login claude <name>/);
 });
 
 test("corrupt auth is reported and remains unchanged", async () => {
@@ -661,7 +671,7 @@ test("list renders full Codex paths with spaces instead of parsing display strin
 	]);
 	await command.handler("list", ctx);
 	assert.ok(lastNotice().message.includes(`openai-codex-space  ${path}  not logged in`));
-	assert.match(lastNotice().message, /\/login → "OpenAI Codex \(space\)"/);
+	assert.match(lastNotice().message, /\/account login codex space/);
 });
 
 test("Claude adapter returns typed status entries without credentials or command labels", async () => {
@@ -674,4 +684,164 @@ test("Claude adapter returns typed status entries without credentials or command
 		],
 		unsavedLogin: undefined,
 	});
+});
+
+const AUTH_URL = "https://claude.ai/oauth/authorize?state=test";
+const browserLogin = (n) => async (interaction) => {
+	interaction.notify({ type: "auth_url", url: AUTH_URL });
+	return cred(n);
+};
+
+test("login claude without a current login saves, activates and explains the private window", async () => {
+	resetFixture();
+	writeAuth(undefined);
+	anthropicLogin = browserLogin("fresh");
+	await account("login claude fresh");
+	const store = readJson(STORE);
+	assert.equal(store.accounts.fresh.cred.refresh, "refresh-fresh");
+	assert.equal(store.active, "fresh");
+	assert.equal(readJson(AUTH).anthropic.refresh, "refresh-fresh");
+	assert.deepEqual(readJson(AUTH).openai, { type: "api_key", key: "openai-key" });
+	const urlNotice = notices.find((notice) => notice.message.includes(AUTH_URL));
+	assert.match(urlNotice.message, /private/);
+	assert.deepEqual(statuses.at(-1), { key: "claude-account", text: "claude: fresh" });
+});
+
+test("login claude keeps the active account until the user confirms the switch", async () => {
+	resetFixture();
+	anthropicLogin = browserLogin("fresh");
+	confirmImpl = async () => false;
+	await account("login claude fresh");
+	assert.equal(readJson(STORE).accounts.fresh.cred.refresh, "refresh-fresh");
+	assert.equal(readJson(STORE).active, "work");
+	assert.equal(readJson(AUTH).anthropic.refresh, "refresh-work");
+	assert.match(lastNotice().message, /\/account fresh/);
+
+	resetUi();
+	anthropicLogin = browserLogin("other");
+	const titles = [];
+	confirmImpl = async (title) => { titles.push(title); return true; };
+	await account("login claude other");
+	assert.deepEqual(titles, ["Switch account?"]);
+	assert.equal(readJson(AUTH).anthropic.refresh, "refresh-other");
+	assert.equal(readJson(STORE).accounts.work.cred.refresh, "refresh-work");
+	assert.equal(readJson(STORE).active, "other");
+});
+
+test("login claude replaces the slot of the active account in place", async () => {
+	resetFixture();
+	anthropicLogin = browserLogin("work-again");
+	const titles = [];
+	confirmImpl = async (title) => { titles.push(title); return true; };
+	await account("login claude work");
+	assert.deepEqual(titles, ["Replace account?"]);
+	assert.equal(readJson(STORE).accounts.work.cred.refresh, "refresh-work-again");
+	assert.equal(readJson(AUTH).anthropic.refresh, "refresh-work-again");
+});
+
+test("login claude rejects the browser's already signed-in account and saves nothing", async () => {
+	resetFixture();
+	anthropicLogin = browserLogin("same");
+	const blockedFetch = globalThis.fetch;
+	globalThis.fetch = async () => Response.json({ account: { email_address: "work@example.com" } });
+	const before = snapshotCredentials();
+	try {
+		await account("login claude second");
+	} finally {
+		globalThis.fetch = blockedFetch;
+	}
+	assert.equal(lastNotice().level, "warning");
+	assert.match(lastNotice().message, /same Claude account as "work".*private window/);
+	assert.deepEqual(snapshotCredentials(), before);
+});
+
+test("cancelling the login prompt aborts the flow without changes", async () => {
+	resetFixture();
+	let flowSignal;
+	anthropicLogin = async (interaction) => {
+		flowSignal = interaction.signal;
+		await interaction.prompt({ type: "manual_code", message: "Paste the code" });
+		return cred("never");
+	};
+	const before = snapshotCredentials();
+	await account("login claude fresh");
+	assert.equal(flowSignal.aborted, true);
+	assert.match(lastNotice().message, /Login cancelled/);
+	assert.deepEqual(snapshotCredentials(), before);
+});
+
+test("a prompt withdrawn by the flow (browser callback won) does not cancel the login", async () => {
+	resetFixture();
+	writeAuth(undefined);
+	inputImpl = (_title, _placeholder, { signal }) =>
+		new Promise((resolve) => signal.addEventListener("abort", () => resolve(undefined)));
+	anthropicLogin = async (interaction) => {
+		const callbackWon = new AbortController();
+		const manual = interaction.prompt({ type: "manual_code", message: "Paste the code", signal: callbackWon.signal }).catch(() => undefined);
+		callbackWon.abort();
+		await manual;
+		assert.equal(interaction.signal.aborted, false);
+		return cred("callback");
+	};
+	await account("login claude fresh");
+	assert.equal(readJson(AUTH).anthropic.refresh, "refresh-callback");
+});
+
+test("login claude validates the name before starting the browser flow", async () => {
+	resetFixture();
+	const before = snapshotCredentials();
+	for (const name of ["bad name", "login", "claude:work"]) {
+		resetUi();
+		await account(`login claude ${name}`);
+		assert.equal(lastNotice().level, "warning");
+		assert.match(lastNotice().message, /Usage: \/account login claude <name>/);
+	}
+	assert.deepEqual(snapshotCredentials(), before);
+});
+
+test("login codex for a missing home explains the Codex CLI step and changes nothing", async () => {
+	resetFixture();
+	const before = snapshotCredentials();
+	await account("login codex fresh");
+	assert.equal(lastNotice().level, "warning");
+	assert.ok(lastNotice().message.includes(`CODEX_HOME=${join(home, ".codex-fresh")} codex login`));
+	assert.match(lastNotice().message, /private/);
+	assert.ok(!providers.has("openai-codex-fresh"));
+	assert.deepEqual(snapshotCredentials(), before);
+});
+
+test("login codex registers a home created after load and imports its tokens", async () => {
+	resetFixture();
+	mkdirSync(join(home, ".codex-newbie"));
+	writeFileSync(join(home, ".codex-newbie", "auth.json"), JSON.stringify({ tokens: {
+		access_token: jwt({ exp: 4_000_000_000, "https://api.openai.com/auth": { chatgpt_account_id: "acct-newbie" } }),
+		refresh_token: "newbie-refresh",
+	} }));
+	models.push({ provider: "openai-codex-newbie", id: "shared", name: "Shared" });
+	await account("login codex newbie");
+	assert.ok(providers.has("openai-codex-newbie"));
+	const auth = readJson(AUTH);
+	assert.equal(auth["openai-codex-newbie"].type, "oauth");
+	assert.equal(auth["openai-codex-newbie"].refresh, "newbie-refresh");
+	assert.equal(auth["openai-codex-newbie"].accountId, "acct-newbie");
+	assert.equal(auth.anthropic.refresh, "refresh-work");
+	assert.deepEqual(refreshCalls, [{ providers: ["openai-codex-newbie"], allowNetwork: false }]);
+	assert.equal(ctx.model.provider, "openai-codex-newbie");
+	assert.ok(values("login codex n").includes("login codex newbie"));
+	await account("list");
+	assert.match(lastNotice().message, /openai-codex-newbie .*logged in$/m);
+});
+
+test("login without a provider asks for the account type and Codex home", async () => {
+	resetFixture();
+	const titles = [];
+	selectImpl = async (title, rows) => {
+		titles.push(title);
+		return title.startsWith("Log in to which") ? rows.find((row) => row.startsWith("Codex")) : "team";
+	};
+	confirmImpl = async () => false;
+	await account("login");
+	assert.deepEqual(titles, ["Log in to which account type?", "Log in which Codex home?"]);
+	assert.equal(readJson(AUTH)["openai-codex-team"].refresh, "codex-refresh");
+	assert.equal(setModelCalls.length, 0);
 });

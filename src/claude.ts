@@ -3,10 +3,11 @@
  * switch between them.
  *
  * Flow:
- *   1. /login                → built-in Pi login (Anthropic). Pi writes auth.json.
- *   2. /account save work    → snapshot the current login under the name "work".
- *   3. /logout, /login with the other Claude account, then /account save personal
- *   4. /account work | /account personal | /account (picker) to switch.
+ *   1. /account login claude work      → browser login, saved as "work".
+ *   2. /account login claude personal  → open the printed URL in a private window
+ *                                        so claude.ai does not reuse "work".
+ *   3. /account work | /account personal | /account (picker) to switch.
+ * An existing built-in /login can still be adopted with /account save <name>.
  *
  * How it works: Pi keeps exactly one `anthropic` credential in auth.json and
  * re-reads the file when its revision changes. This extension stores the other
@@ -21,6 +22,7 @@
  *
  * Note: auth.json is shared — switching affects every running Pi session.
  */
+import type { AuthEvent, AuthPrompt, OAuthAuth, ProviderAuthInteraction } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmdirSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -36,7 +38,10 @@ const LOCK_STALE_MS = 30_000;
 const LOCK_TIMEOUT_MS = 20_000; // a Pi token refresh can hold the lock ~15 s
 const PROFILE_URL = "https://api.anthropic.com/api/oauth/profile";
 const STATUS_KEY = "claude-account";
-export const SUBCOMMANDS = ["save", "add", "list", "ls", "remove", "rm", "use", "switch", "help"];
+export const SUBCOMMANDS = ["login", "save", "add", "list", "ls", "remove", "rm", "use", "switch", "help"];
+const LOGIN_HINT =
+	"Adding another Claude account? Open the URL in a private/incognito window or another browser profile " +
+	"(or sign out of claude.ai first); otherwise claude.ai logs in the account that is already signed in.";
 
 interface OAuthCred {
 	type: "oauth";
@@ -95,6 +100,15 @@ function isOAuth(c: unknown): c is OAuthCred {
 
 export function readAuth(): Record<string, unknown> {
 	return readJsonStrict<Record<string, unknown>>(AUTH_PATH) ?? {};
+}
+
+/** Locked read-modify-write of auth.json; other providers' entries are kept. */
+export function mutateAuth(fn: (auth: Record<string, unknown>) => void): Promise<void> {
+	return withAuthLock(() => {
+		const auth = readAuth();
+		fn(auth);
+		writeAtomic(AUTH_PATH, auth);
+	});
 }
 
 function readCurrentCred(): OAuthCred | undefined {
@@ -252,16 +266,23 @@ export const ClaudeProvider = {
 	useAccount: cmdUse,
 	saveAccount: cmdSave,
 	removeAccount: cmdRemove,
+	login: cmdLogin,
 };
 
+function isValidName(name: string): boolean {
+	return /^[\w.-]+$/.test(name) && !SUBCOMMANDS.includes(name);
+}
+
+const NAME_RULES = `letters, digits, . _ -; not ${SUBCOMMANDS.join("/")}`;
+
 async function cmdSave(name: string, ctx: ExtensionContext): Promise<void> {
-	if (!/^[\w.-]+$/.test(name) || SUBCOMMANDS.includes(name)) {
-		ctx.ui.notify(`Usage: /account save <name>  (letters, digits, . _ -; not ${SUBCOMMANDS.join("/")})`, "warning");
+	if (!isValidName(name)) {
+		ctx.ui.notify(`Usage: /account save <name>  (${NAME_RULES})`, "warning");
 		return;
 	}
 	const cred = readCurrentCred();
 	if (!cred) {
-		ctx.ui.notify("No Anthropic OAuth login in auth.json. Run /login first.", "warning");
+		ctx.ui.notify("No Anthropic OAuth login in auth.json. Run /account login claude <name> to log in and save it.", "warning");
 		return;
 	}
 	const store = loadStore();
@@ -343,6 +364,120 @@ async function cmdUse(name: string, ctx: ExtensionContext): Promise<void> {
 	});
 	ctx.ui.notify(`Switched Anthropic account to "${label(name, slot)}".`, "info");
 	updateStatus(ctx, { kind: "matched", name, cred: slot.cred });
+}
+
+/**
+ * Bridges Pi's provider login prompts to extension dialogs. The login URL is
+ * shown, never opened: a second account needs a private browser window.
+ */
+function createInteraction(ctx: ExtensionContext, controller: AbortController): ProviderAuthInteraction {
+	const dismissed = (signal: AbortSignal): never => {
+		// The flow itself withdrew the prompt (e.g. the browser callback won the race).
+		if (signal.aborted) throw new Error("Login prompt dismissed.");
+		controller.abort();
+		throw new Error("Login cancelled.");
+	};
+	return {
+		signal: controller.signal,
+		notify(event: AuthEvent) {
+			if (event.type === "auth_url") {
+				ctx.ui.notify(["Open this URL to log in to Claude:", event.url, "", LOGIN_HINT].join("\n"), "info");
+			} else if (event.type === "device_code") {
+				ctx.ui.notify(`Open ${event.verificationUri} and enter the code ${event.userCode}.`, "info");
+			} else {
+				ctx.ui.notify(event.message, "info");
+			}
+		},
+		async prompt(prompt: AuthPrompt) {
+			const signal = prompt.signal ? AbortSignal.any([prompt.signal, controller.signal]) : controller.signal;
+			if (prompt.type === "select") {
+				const labels = prompt.options.map((option) => option.label);
+				const choice = await ctx.ui.select(prompt.message, labels, { signal });
+				const option = prompt.options.find((_option, index) => labels[index] === choice);
+				return option ? option.id : dismissed(signal);
+			}
+			const value = await ctx.ui.input(prompt.message, prompt.placeholder, { signal });
+			return value ?? dismissed(signal);
+		},
+	};
+}
+
+/** Runs Pi's Anthropic OAuth flow. Undefined when the user cancels. */
+async function runOAuthLogin(oauth: OAuthAuth, ctx: ExtensionContext): Promise<OAuthCred | undefined> {
+	const controller = new AbortController();
+	try {
+		return await oauth.login(createInteraction(ctx, controller));
+	} catch (err) {
+		if (controller.signal.aborted) return undefined;
+		throw err;
+	}
+}
+
+/** Log in to Claude in the browser and save the result as `name`, no built-in /login needed. */
+async function cmdLogin(name: string, ctx: ExtensionContext): Promise<void> {
+	if (!ctx.hasUI) {
+		ctx.ui.notify("/account login claude needs the interactive UI (browser login with prompts).", "error");
+		return;
+	}
+	if (!name) {
+		name = (await ctx.ui.input("Name for this Claude account", "e.g. work"))?.trim() ?? "";
+		if (!name) return;
+	}
+	if (!isValidName(name)) {
+		ctx.ui.notify(`Usage: /account login claude <name>  (${NAME_RULES})`, "warning");
+		return;
+	}
+	const oauth = ctx.modelRegistry.getProvider(PROVIDER)?.auth.oauth;
+	if (!oauth) throw new Error("This Pi build has no Anthropic (Claude Pro/Max) OAuth login.");
+	const existing = loadStore().accounts[name];
+	if (existing) {
+		const ok = await ctx.ui.confirm("Replace account?", `"${label(name, existing)}" already exists. Log in again and replace it?`);
+		if (!ok) return;
+	}
+
+	const cred = await runOAuthLogin(oauth, ctx);
+	if (!cred) {
+		ctx.ui.notify("Login cancelled. Nothing changed.", "info");
+		return;
+	}
+	const profile = await fetchProfile(cred);
+	const dup = findByIdentity(loadStore(), profile);
+	if (dup && dup !== name) {
+		const who = profile?.email ? ` (${profile.email})` : "";
+		ctx.ui.notify(
+			`This is the same Claude account as "${dup}"${who}: the browser reused its claude.ai session. Nothing was saved. ` +
+				`Run /account login claude ${name} again and open the URL in a private window, or sign out of claude.ai first.`,
+			"warning",
+		);
+		return;
+	}
+
+	// Activate at once when nothing in auth.json would be lost: no login, or this same account.
+	const before = await sync();
+	const replacesCurrent =
+		before.kind === "none" ||
+		(before.kind === "matched" && before.name === name) ||
+		(before.kind === "unknown" && !!profile?.accountId && before.profile?.accountId === profile.accountId);
+	const seen = before.kind === "none" ? undefined : before.cred.refresh;
+	const slot: Slot = { cred, accountId: profile?.accountId, email: profile?.email, savedAt: Date.now() };
+	const activated = await mutateStore((s) => {
+		s.accounts[name] = slot;
+		if (!replacesCurrent || readCurrentCred()?.refresh !== seen) return false;
+		const auth = readAuth();
+		auth[PROVIDER] = cred;
+		writeAtomic(AUTH_PATH, auth);
+		s.active = name;
+		return true;
+	});
+	if (activated) {
+		ctx.ui.notify(`Logged in and switched Claude to "${label(name, slot)}".`, "info");
+		updateStatus(ctx, { kind: "matched", name, cred });
+		return;
+	}
+	ctx.ui.notify(`Logged in and saved Claude account "${label(name, slot)}".`, "info");
+	const ok = await ctx.ui.confirm("Switch account?", `Switch Claude to "${name}" now? This affects every running Pi session.`);
+	if (ok) await cmdUse(name, ctx);
+	else ctx.ui.notify(`Run /account ${name} to switch later.`, "info");
 }
 
 async function cmdRemove(name: string, ctx: ExtensionContext): Promise<void> {

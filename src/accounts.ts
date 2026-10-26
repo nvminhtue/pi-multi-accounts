@@ -45,18 +45,18 @@ function formatList(claude: ClaudeStatus, codex: CodexEntry[]): string {
 		const marker = entry.isActive ? "●" : "○";
 		lines.push(`[Claude] ${marker} ${formatClaudeName(entry)}`);
 	}
-	if (!claude.entries.length) lines.push("No saved accounts. Run /login, then /account save <name>.");
+	if (!claude.entries.length) lines.push("No saved accounts. Run /account login claude <name>.");
 	if (claude.unsavedLogin) {
 		const email = claude.unsavedLogin.email ? ` (${claude.unsavedLogin.email})` : "";
 		lines.push(`! unsaved login in auth.json${email} — /account save <name>`);
 	}
 	lines.push("", "Codex providers (model selection for this session only):");
 	for (const entry of codex) {
-		const state = entry.isLoggedIn ? "logged in" : `not logged in (/login → "OpenAI Codex (${entry.name})")`;
+		const state = entry.isLoggedIn ? "logged in" : `not logged in (/account login codex ${entry.name})`;
 		const marker = entry.isActive ? "●" : "○";
 		lines.push(`  ${marker} ${entry.name}  ${entry.id}  ${entry.authPath}  ${state}`);
 	}
-	if (!codex.length) lines.push("No registered Codex homes. Run /reload after adding a home.");
+	if (!codex.length) lines.push("No registered Codex homes. Run /account login codex <name> to add one.");
 	return lines.join("\n");
 }
 
@@ -83,6 +83,9 @@ function getCompletions(prefix: string, ids: string[]) {
 		...targets,
 		...targets.flatMap((target) => [`use ${target}`, `switch ${target}`]),
 		...names.flatMap((name) => [`remove ${name}`, `rm ${name}`]),
+		"login claude",
+		"login codex",
+		...ids.map((id) => `login codex ${id.replace(/^openai-codex-/, "")}`),
 	];
 	const matches = candidates.filter((candidate) => candidate.startsWith(prefix));
 	return matches.length ? matches.map((value) => ({ value, label: value })) : null;
@@ -130,11 +133,31 @@ export function registerAccounts(pi: ExtensionAPI, homes: readonly CodexHome[]):
 		else throw new Error(`Unknown account "${target}". Run /account list; new Codex homes require /reload.`);
 	}
 
+	async function cmdLogin(arg: string, ctx: ExtensionContext): Promise<void> {
+		const [first = "", ...rest] = arg.split(/\s+/).filter(Boolean);
+		let provider = first === "claude" || first === "codex" ? first : undefined;
+		const name = provider ? rest.join(" ") : arg;
+		if (!provider) {
+			if (!ctx.hasUI) {
+				ctx.ui.notify("Usage: /account login claude <name> | /account login codex <name>", "warning");
+				return;
+			}
+			const claude = "Claude Pro/Max — browser login, saved as a switchable account";
+			const codex = "Codex (ChatGPT) — import a Codex CLI login as provider openai-codex-<name>";
+			const choice = await ctx.ui.select("Log in to which account type?", [claude, codex]);
+			if (!choice) return;
+			provider = choice === claude ? "claude" : "codex";
+		}
+		if (provider === "claude") await ClaudeProvider.login(name, ctx);
+		else await codex.login(name, ctx);
+	}
+
 	async function handleCommand(args: string, ctx: ExtensionContext): Promise<void> {
 		const [sub, ...rest] = args.trim().split(/\s+/).filter(Boolean);
 		const arg = rest.join(" ");
 		switch (sub) {
 			case undefined: return cmdPick(ctx);
+			case "login": return cmdLogin(arg, ctx);
 			case "save":
 			case "add": return ClaudeProvider.saveAccount(arg, ctx);
 			case "remove":
@@ -162,16 +185,19 @@ export function registerAccounts(pi: ExtensionAPI, homes: readonly CodexHome[]):
 }
 
 const HELP = [
+	"/account login claude <name>  log in to a Claude Pro/Max account in the browser and save it as <name>",
+	"/account login codex <name>   import ~/.codex-<name> (made by `CODEX_HOME=~/.codex-<name> codex login`)",
 	"/account                 pick a Claude account or Codex provider",
 	"/account <name/id>       use an exact saved Claude name or registered Codex ID",
 	"/account use|switch      pick or use a target",
 	"/account claude:<name>   choose Claude when a name collides with a Codex ID",
 	"/account codex:<id>      choose Codex when an ID collides with a Claude name",
-	"/account save|add <name> save current Claude login (literal Claude name)",
+	"/account save|add <name> save the current built-in /login as a Claude account (literal Claude name)",
 	"/account remove|rm <name> forget saved Claude login (literal Claude name)",
 	"/account list|ls         list accounts, login states and auth paths",
+	"Another account of the same service? Open the login URL in a private window, or the browser reuses the signed-in account.",
 	"Claude changes shared credentials, not the session model. Save and remove are Claude-only.",
 	"Codex changes only this session's model, not Claude credentials or the default model.",
-	"Codex IDs: openai-codex-<name>. Run /login first; /reload after adding a home.",
+	"Codex IDs: openai-codex-<name>.",
 	"Codex keeps the current model ID when supported; otherwise choose a model (or use /model without UI).",
 ].join("\n");
