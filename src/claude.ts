@@ -27,7 +27,8 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { existsSync, mkdirSync, readFileSync, renameSync, rmdirSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { ClaudeEntry, ClaudeStatus } from "./accounts.ts";
+import type { ClaudeEntry, ClaudeStatus, ClaudeUsage } from "./accounts.ts";
+import { fetchClaudeUsage, settle } from "./usage.ts";
 
 const PROVIDER = "anthropic";
 const AGENT_DIR = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
@@ -38,7 +39,7 @@ const LOCK_STALE_MS = 30_000;
 const LOCK_TIMEOUT_MS = 20_000; // a Pi token refresh can hold the lock ~15 s
 const PROFILE_URL = "https://api.anthropic.com/api/oauth/profile";
 const STATUS_KEY = "claude-account";
-export const SUBCOMMANDS = ["login", "save", "add", "list", "ls", "remove", "rm", "use", "switch", "help"];
+export const SUBCOMMANDS = ["login", "save", "add", "list", "ls", "usage", "remove", "rm", "use", "switch", "help"];
 const LOGIN_HINT =
 	"Adding another Claude account? Open the URL in a private/incognito window or another browser profile " +
 	"(or sign out of claude.ai first); otherwise claude.ai logs in the account that is already signed in.";
@@ -262,6 +263,7 @@ function updateStatus(ctx: ExtensionContext, result: SyncResult): void {
 
 export const ClaudeProvider = {
 	getStatus: overview,
+	getUsage: usage,
 	getSavedNames: () => Object.keys(loadStore().accounts),
 	useAccount: cmdUse,
 	saveAccount: cmdSave,
@@ -495,19 +497,82 @@ async function cmdRemove(name: string, ctx: ExtensionContext): Promise<void> {
 	updateStatus(ctx, await sync());
 }
 
-async function overview(ctx: ExtensionContext): Promise<ClaudeStatus> {
-	const result = await sync();
-	updateStatus(ctx, result);
-	const store = loadStore();
-	const active = result.kind === "matched" ? result.name : undefined;
-	const entries: ClaudeEntry[] = Object.keys(store.accounts).map((name) => ({
+function toEntries(store: Store, active: string | undefined): ClaudeEntry[] {
+	return Object.keys(store.accounts).map((name) => ({
 		provider: "claude",
 		id: name,
 		name,
 		email: store.accounts[name].email,
 		isActive: name === active,
 	}));
+}
+
+async function overview(ctx: ExtensionContext): Promise<ClaudeStatus> {
+	const result = await sync();
+	updateStatus(ctx, result);
+	const entries = toEntries(loadStore(), result.kind === "matched" ? result.name : undefined);
 	const unsavedLogin = result.kind === "unknown" ? { email: result.profile?.email } : undefined;
+	return { entries, unsavedLogin };
+}
+
+/** The login in auth.json, refreshed by Pi under its own lock when it is about to expire. */
+async function activeAccess(ctx: ExtensionContext): Promise<string> {
+	const access = (await ctx.modelRegistry.getProviderAuth(PROVIDER))?.auth.apiKey;
+	if (!access) throw new Error("no Anthropic login in auth.json");
+	return access;
+}
+
+/**
+ * A saved, inactive login. An expired token is refreshed here and the rotated
+ * pair is stored at once: the old refresh token stops working after the exchange.
+ */
+async function slotAccess(name: string, slot: Slot, ctx: ExtensionContext): Promise<string> {
+	if (slot.cred.expires - Date.now() > 60_000) return slot.cred.access;
+	const oauth = ctx.modelRegistry.getProvider(PROVIDER)?.auth.oauth;
+	if (!oauth) throw new Error("this Pi build has no Anthropic OAuth refresh");
+	const used = slot.cred.refresh;
+	let fresh: OAuthCred;
+	try {
+		fresh = { ...slot.cred, ...(await oauth.refresh(slot.cred, AbortSignal.timeout(15_000))) };
+	} catch {
+		// Pi's message can quote the token endpoint's response; keep the notice short.
+		throw new Error(`token refresh failed; run /account login claude ${name}`);
+	}
+	await mutateStore((s) => {
+		const target = s.accounts[name];
+		if (target?.cred.refresh !== used) return; // replaced meanwhile (login/save); keep that one
+		target.cred = fresh;
+		// Switched to this account meanwhile: auth.json holds the refresh token just spent.
+		const auth = readAuth();
+		const current = auth[PROVIDER];
+		if (isOAuth(current) && current.refresh === used) {
+			auth[PROVIDER] = fresh;
+			writeAtomic(AUTH_PATH, auth);
+		}
+	});
+	return fresh.access;
+}
+
+/** Subscription usage of every saved Claude account, plus an unsaved login in auth.json. */
+async function usage(ctx: ExtensionContext): Promise<ClaudeUsage> {
+	const result = await sync();
+	updateStatus(ctx, result);
+	const store = loadStore();
+	const active = result.kind === "matched" ? result.name : undefined;
+	const entries = await Promise.all(
+		toEntries(store, active).map(async (entry) => ({
+			entry,
+			usage: await settle(async () =>
+				fetchClaudeUsage(entry.isActive ? await activeAccess(ctx) : await slotAccess(entry.name, store.accounts[entry.name], ctx)),
+			),
+		})),
+	);
+	const unsavedLogin =
+		result.kind === "unknown"
+			? { email: result.profile?.email, usage: await settle(async () => fetchClaudeUsage(await activeAccess(ctx))) }
+			: undefined;
+	// Pi may have refreshed the active token for this lookup: copy it into its slot.
+	if (active) await sync();
 	return { entries, unsavedLogin };
 }
 

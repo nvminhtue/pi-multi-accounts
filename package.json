@@ -1,6 +1,6 @@
 {
   "name": "pi-multi-accounts",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": false,
   "type": "module",
   "description": "Pi extension: switch between several Claude Pro/Max OAuth logins with /account, and use extra ChatGPT (Codex) logins as parallel openai-codex-<name> providers",
