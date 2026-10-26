@@ -8,8 +8,9 @@
  * `openai-codex-responses` implementation; the chatgpt-account-id header is
  * derived from the access token, so each provider talks as its own account.
  *
- * Setup: /login → "OpenAI Codex (<name>)" imports the tokens from the file
- * (no browser). Then pick the model with /model.
+ * Setup: `CODEX_HOME=~/.codex-<name> codex login`, then `/account login codex
+ * <name>` imports the tokens from the file (no browser) and registers the
+ * provider when the home is new. Then pick it with /account or /model.
  *
  * The Codex auth file stays the source of truth: on refresh the extension
  * first adopts newer tokens from the file (e.g. refreshed by
@@ -22,7 +23,7 @@ import type { ExtensionAPI, ProviderModelConfig, ExtensionContext } from "@earen
 import { existsSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { readAuth } from "./claude.ts";
+import { mutateAuth, readAuth } from "./claude.ts";
 import type { CodexEntry } from "./accounts.ts";
 
 const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -136,7 +137,7 @@ export async function refreshCred(home: CodexHome, refreshToken: string, signal:
 		const code = typeof body.error === "string" ? ` (${body.error})` : "";
 		throw new Error(
 			`OpenAI Codex (${home.name}) token refresh failed: HTTP ${response.status}${code}. ` +
-				`Run \`CODEX_HOME=${home.dir} codex login\`, then /login again.`,
+				`Run \`CODEX_HOME=${home.dir} codex login\`, then /account login codex ${home.name}.`,
 		);
 	}
 	const json = (await response.json()) as { access_token?: string; refresh_token?: string; id_token?: string };
@@ -166,36 +167,38 @@ function codexModels(): ProviderModelConfig[] {
 	return getBuiltinModels("openai-codex").map(({ provider: _provider, ...model }) => ({ ...model }) as ProviderModelConfig);
 }
 
+function registerHome(pi: ExtensionAPI, home: CodexHome, models: ProviderModelConfig[]): void {
+	pi.registerProvider(`openai-codex-${home.name}`, {
+		name: `OpenAI Codex (${home.name})`,
+		baseUrl: BASE_URL,
+		api: "openai-codex-responses",
+		models,
+		oauth: {
+			name: `OpenAI Codex (${home.name})`,
+			isSubscription: true,
+			async login(callbacks) {
+				const cred = credFromFile(home.authPath);
+				callbacks.onProgress?.(`Imported ChatGPT login from ${home.authPath}`);
+				return cred;
+			},
+			async refreshToken(credentials, signal) {
+				// Adopt tokens the Codex CLI refreshed meanwhile; otherwise refresh ourselves.
+				const fromFile = credFromFile(home.authPath);
+				if (shouldAdopt(fromFile, credentials.access)) return fromFile;
+				return refreshCred(home, fromFile.refresh, signal);
+			},
+			getApiKey: (credentials) => credentials.access,
+		},
+	});
+}
+
 export function registerCodex(pi: ExtensionAPI, homes = discoverHomes()): CodexHome[] {
 	const models = codexModels();
-	for (const home of homes) {
-		pi.registerProvider(`openai-codex-${home.name}`, {
-			name: `OpenAI Codex (${home.name})`,
-			baseUrl: BASE_URL,
-			api: "openai-codex-responses",
-			models,
-			oauth: {
-				name: `OpenAI Codex (${home.name})`,
-				isSubscription: true,
-				async login(callbacks) {
-					const cred = credFromFile(home.authPath);
-					callbacks.onProgress?.(`Imported ChatGPT login from ${home.authPath}`);
-					return cred;
-				},
-				async refreshToken(credentials, signal) {
-					// Adopt tokens the Codex CLI refreshed meanwhile; otherwise refresh ourselves.
-					const fromFile = credFromFile(home.authPath);
-					if (shouldAdopt(fromFile, credentials.access)) return fromFile;
-					return refreshCred(home, fromFile.refresh, signal);
-				},
-				getApiKey: (credentials) => credentials.access,
-			},
-		});
-	}
+	for (const home of homes) registerHome(pi, home, models);
 	return homes;
 }
 
-/** One adapter per registration snapshot; later homes require /reload. */
+/** One adapter per registration snapshot; /account login codex registers homes created later. */
 export function createCodexProvider(pi: ExtensionAPI, homes: readonly CodexHome[]) {
 	const registeredHomes = [...homes];
 	const getProviderId = (home: CodexHome) => `openai-codex-${home.name}`;
@@ -219,7 +222,7 @@ export function createCodexProvider(pi: ExtensionAPI, homes: readonly CodexHome[
 
 	function notifyLogin(id: string, ctx: ExtensionContext): void {
 		const home = registeredHomes.find((home) => getProviderId(home) === id);
-		ctx.ui.notify(`No configured auth for ${id}. Run /login → "OpenAI Codex (${home?.name})" first.`, "error");
+		ctx.ui.notify(`No configured auth for ${id}. Run /account login codex ${home?.name} first.`, "error");
 	}
 
 	async function chooseModel(id: string, ctx: ExtensionContext) {
@@ -241,7 +244,7 @@ export function createCodexProvider(pi: ExtensionAPI, homes: readonly CodexHome[
 
 	async function useAccount(id: string, ctx: ExtensionContext): Promise<void> {
 		if (!getIds().includes(id)) {
-			ctx.ui.notify(`Unknown Codex provider "${id}". Run /reload after adding a home.`, "error");
+			ctx.ui.notify(`Unknown Codex provider "${id}". Run /account login codex <name> to add a home.`, "error");
 			return;
 		}
 		const sameModel = ctx.model ? ctx.modelRegistry.find(id, ctx.model.id) : undefined;
@@ -253,5 +256,64 @@ export function createCodexProvider(pi: ExtensionAPI, homes: readonly CodexHome[
 		ctx.ui.notify(`Switched this session to ${id}/${model.id}.`, "info");
 	}
 
-	return { getIds, getEntries, useAccount };
+	/** Existing ~/.codex-<name> by name, else the path `codex login` should create. */
+	function findHome(name: string): CodexHome {
+		const known = [...registeredHomes, ...discoverHomes()].find((home) => home.name === name);
+		const dir = join(homedir(), `.codex-${name}`);
+		return known ?? { name, dir, authPath: join(dir, "auth.json") };
+	}
+
+	/** Undefined when cancelled. */
+	async function pickName(ctx: ExtensionContext): Promise<string | undefined> {
+		const names = [...new Set([...registeredHomes, ...discoverHomes()].map((home) => home.name))];
+		const other = "Another ChatGPT account (new ~/.codex-<name>)";
+		const choice = names.length ? await ctx.ui.select("Log in which Codex home?", [...names, other]) : other;
+		if (choice !== other) return choice;
+		return (await ctx.ui.input("Name for the Codex home (~/.codex-<name>)", "e.g. work"))?.trim() || undefined;
+	}
+
+	/** Import ~/.codex-<name>/auth.json into Pi, i.e. the built-in /login → "OpenAI Codex (<name>)". */
+	async function login(rawName: string, ctx: ExtensionContext): Promise<void> {
+		let name = rawName.toLowerCase();
+		if (!name && ctx.hasUI) {
+			name = (await pickName(ctx))?.toLowerCase() ?? "";
+			if (!name) return;
+		}
+		if (!HOME_DIR_PATTERN.test(`.codex-${name}`)) {
+			ctx.ui.notify("Usage: /account login codex <name>  (letters, digits, _ -; starts with a letter or digit)", "warning");
+			return;
+		}
+		const home = findHome(name);
+		if (!existsSync(home.authPath)) {
+			ctx.ui.notify(
+				[
+					`No ChatGPT login in ${home.authPath} yet. In a terminal, run:`,
+					`  CODEX_HOME=${home.dir} codex login`,
+					"Adding another ChatGPT account? Finish that login in a private/incognito window (or sign out of chatgpt.com first); " +
+						"otherwise the browser logs in the account that is already signed in.",
+					`Then run /account login codex ${name} again.`,
+				].join("\n"),
+				"warning",
+			);
+			return;
+		}
+		const cred = credFromFile(home.authPath);
+		const id = getProviderId(home);
+		if (!getIds().includes(id)) {
+			registerHome(pi, home, codexModels());
+			registeredHomes.push(home);
+		}
+		await mutateAuth((auth) => {
+			auth[id] = { type: "oauth", ...cred };
+		});
+		await ctx.modelRegistry.refresh({ providers: [id], allowNetwork: false });
+		ctx.ui.notify(`Logged in ${id} with the ChatGPT login from ${home.authPath}.`, "info");
+		if (!ctx.hasUI) {
+			ctx.ui.notify(`Run /account ${id} to use it in this session.`, "info");
+			return;
+		}
+		if (await ctx.ui.confirm("Use it now?", `Switch this session to ${id}?`)) await useAccount(id, ctx);
+	}
+
+	return { getIds, getEntries, useAccount, login };
 }

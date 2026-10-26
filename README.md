@@ -25,16 +25,21 @@ Then run `/reload` (or restart Pi).
 
 ## Usage
 
-| Command                 | What it does                                        |
-| ----------------------- | --------------------------------------------------- |
-| `/account`              | Pick a Claude account or a registered Codex provider |
-| `/account <name/id>`    | Use an exact saved Claude name or registered Codex provider ID |
-| `/account save <name>`  | Save the current Anthropic `/login` under `<name>`  |
-| `/account list`         | List Claude accounts (● active, ○ inactive) and Codex providers (login state) |
-| `/account remove <name>`| Forget a saved Claude account (`auth.json` is not changed) |
-| `/account help`         | Show command help                                   |
+| Command                       | What it does                                        |
+| ----------------------------- | --------------------------------------------------- |
+| `/account login`              | Ask which account type, then run the matching login below |
+| `/account login claude <name>`| Log in to a Claude Pro/Max account in the browser and save it as `<name>` |
+| `/account login codex <name>` | Import `~/.codex-<name>` (a Codex CLI login) as provider `openai-codex-<name>` |
+| `/account`                    | Pick a Claude account or a registered Codex provider |
+| `/account <name/id>`          | Use an exact saved Claude name or registered Codex provider ID |
+| `/account save <name>`        | Save the current built-in Anthropic `/login` under `<name>` |
+| `/account list`               | List Claude accounts (● active, ○ inactive) and Codex providers (login state) |
+| `/account remove <name>`      | Forget a saved Claude account (`auth.json` is not changed) |
+| `/account help`               | Show command help                                   |
 
-Save and remove work on **Claude accounts only**. Their arguments are literal Claude names, not provider qualifiers.
+Use `/account login` instead of Pi's built-in `/login` for this extension's accounts. It explains every step in the session, saves the Claude login under a name, and registers new Codex homes without `/reload`. The built-in `/login` still works; adopt its Claude login with `/account save <name>`.
+
+Save and remove work on **Claude accounts only**. Their arguments are literal Claude names, not provider qualifiers. `login` is a reserved name: a Claude account saved as `login` by an older version stays reachable with `/account use login` or `/account claude:login`.
 
 Claude selection changes shared credentials. It does not change the session model. Codex selection changes only this session's model. It does not change Claude credentials or the default model for new sessions.
 
@@ -46,27 +51,27 @@ Aliases: `add` = `save`, `ls` = `list`, `rm` = `remove`, `use`/`switch` = switch
 
 The footer shows `claude: <name>` for the active saved account, or `claude: unsaved login` when the login in `auth.json` is not saved yet.
 
-## Logging in to a second account
+## Logging in to Claude accounts
 
-1. `/login` with your first Claude account, then `/account save work`.
-2. Run `/login` again. Pi reuses the browser's existing claude.ai session, so you would simply get the same account back. To avoid that, do one of:
-   - open the login URL Pi prints in a **private/incognito window**, or
+1. `/account login claude work`. Pi prints a claude.ai login URL and waits; it does not open the browser itself. Sign in, and the login is saved as `work`. If the browser cannot reach `localhost`, paste the final redirect URL or code into the prompt.
+2. `/account login claude personal` for the second account. claude.ai reuses the browser's signed-in session, so the URL in a normal window gives you `work` again. Instead, either:
+   - open the URL in a **private/incognito window**, or
    - use a **different browser profile**, or
    - **sign out of claude.ai** first.
 
-   Copy the login URL Pi prints into the private window and sign in with the second account.
-3. `/account save personal`.
+   If the browser still returns an account that is already saved, the command reports it and saves nothing. This check uses the Anthropic profile lookup; when that lookup fails, compare the emails with `/account list`.
+3. A login is activated at once when `auth.json` has no Claude login or holds the same account. Otherwise you are asked whether to switch, because a switch affects every running Pi session.
 4. Run `/account list` and check that the emails differ.
 
 ## Codex accounts
 
-1. For each extra ChatGPT account, log in with the Codex CLI into its own folder: `CODEX_HOME=~/.codex-<name> codex login`.
-2. In Pi, run `/login` and choose **"OpenAI Codex (<name>)"**. This imports the tokens from `~/.codex-<name>/auth.json`; no browser is involved.
-3. Select the provider with `/account openai-codex-<name>`, or use the unified `/account` picker. The command keeps the current model ID if the target provider supports it. Otherwise, it asks you to choose a target model. Cancel leaves the session unchanged. Without dialog support, choose explicitly with `/model`, e.g. `openai-codex-<name>/<model>`.
+1. For each extra ChatGPT account, log in with the Codex CLI into its own folder: `CODEX_HOME=~/.codex-<name> codex login`. For a second account, finish that login in a private window, or sign out of chatgpt.com first.
+2. In Pi, run `/account login codex <name>`. This imports the tokens from `~/.codex-<name>/auth.json`; no browser is involved. A folder created after Pi started is registered on the spot. Without `<name>`, the command lists the found homes. If the folder has no login yet, it prints the exact `codex login` command. (The built-in `/login` → **"OpenAI Codex (<name>)"** does the same import for already registered homes.)
+3. Select the provider with `/account openai-codex-<name>`, or use the unified `/account` picker. `/account login codex` also offers to switch right away. The command keeps the current model ID if the target provider supports it. Otherwise, it asks you to choose a target model. Cancel leaves the session unchanged. Without dialog support, choose explicitly with `/model`, e.g. `openai-codex-<name>/<model>`.
 
-The provider has the same models as the built-in `openai-codex`. Run `/login` first to configure its auth in Pi. The command reports success only after Pi accepts the model change. `/account list` shows each provider's auth path, login state, and current-session active marker.
+The provider has the same models as the built-in `openai-codex`. The command reports success only after Pi accepts the model change. `/account list` shows each provider's auth path, login state, and current-session active marker.
 
-The Codex auth file stays the source of truth: on refresh the extension first adopts newer tokens found in the file (e.g. refreshed by the Codex CLI); otherwise it refreshes with the file's refresh token and writes the rotated tokens back. New `~/.codex-*` folders are discovered at load time, so run `/reload` after creating one.
+The Codex auth file stays the source of truth: on refresh the extension first adopts newer tokens found in the file (e.g. refreshed by the Codex CLI); otherwise it refreshes with the file's refresh token and writes the rotated tokens back. `~/.codex-*` folders are discovered at load time; later ones are added by `/account login codex <name>` or `/reload`.
 
 ## How it works (Claude)
 
